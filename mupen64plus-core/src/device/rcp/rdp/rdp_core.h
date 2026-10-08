@@ -120,4 +120,16 @@ void write_dps_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mas
 
 void rdp_interrupt_event(void* opaque);
 
+/* The RSP's own RDP list submissions (its CMD_END writes call the gfx plugin directly): the
+ * plugin's list, then a deferred full sync's DP interrupt scheduled as for a CPU write. */
+void rdp_process_list_from_rsp(void);
+
+/* ParaLLEl-RDP's deferred sync: a full sync's DP interrupt waits in the interrupt queue
+ * (so savestates carry it) RDP_DEFERRED_DP_DELAY count cycles ahead, beyond any frame; at the
+ * start of the next frame, with the GPU's work in memory, it is brought forward to fire
+ * shortly after. The RDP thus looks done at the next frame, and its GPU time overlaps the
+ * frontend's wait for the display instead of the CPU's. */
+#define RDP_DEFERRED_DP_DELAY 3000000u
+void rdp_pull_deferred_interrupt(void);
+
 #endif

@@ -16,6 +16,13 @@ unsigned parallel_frame_width(void);
 unsigned parallel_frame_height(void);
 void parallel_begin_frame(void);
 void parallel_set_synchronous_rdp(bool enable);
+/* Deferred sync (with synchronous RDP): at a full sync the CPU goes on and the core raises the
+ * DP interrupt `parallel_deferred_delay` count cycles later, waiting for the GPU then; at the
+ * end of every frame and around savestates the GPU is waited for too. Deterministic (the same
+ * cycles everywhere), unlike asynchronous RDP, with the GPU's work overlapping the CPU's. */
+void parallel_set_deferred_sync(bool enable);
+int parallel_take_deferred_interrupt(void);
+void parallel_wait_deferred_sync(void);
 
 void parallel_set_divot_filter(bool enable);
 void parallel_set_gamma_dither(bool enable);

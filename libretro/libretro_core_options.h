@@ -488,6 +488,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
         {
             { "enabled", NULL },
             { "disabled", NULL },
+            { "deferred", "Deferred (the CPU sees the RDP done at the next frame; online play)" },
             { NULL, NULL },
         },
         "enabled"

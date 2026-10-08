@@ -27,6 +27,19 @@
 #include "device/rcp/mi/mi_controller.h"
 #include "device/rcp/rsp/rsp_core.h"
 #include "plugin/plugin.h"
+#include "api/callbacks.h"
+#include "api/m64p_types.h"
+#include "device/r4300/cp0.h"
+#include "device/r4300/interrupt.h"
+#include "device/r4300/r4300_core.h"
+
+#if defined(HAVE_PARALLEL)
+/* ParaLLEl-RDP's deferred sync (mupen64plus-video-paraLLEl/parallel.h). */
+extern int parallel_take_deferred_interrupt(void);
+extern void parallel_wait_deferred_sync(void);
+#endif
+
+static struct rdp_core* rsp_dp;  /* the RDP the RSP submits to (init_rdp) */
 
 static void update_dpc_status(struct rdp_core* dp, uint32_t w)
 {
@@ -40,7 +53,12 @@ static void update_dpc_status(struct rdp_core* dp, uint32_t w)
         dp->dpc_regs[DPC_STATUS_REG] &= ~DPC_STATUS_FREEZE;
 
         if (dp->do_on_unfreeze & DELAY_DP_INT)
+        {
+#if defined(HAVE_PARALLEL)
+            parallel_wait_deferred_sync();
+#endif
             signal_rcp_interrupt(dp->mi, MI_INTR_DP);
+        }
         if (dp->do_on_unfreeze & DELAY_UPDATESCREEN)
             gfx.updateScreen();
         dp->do_on_unfreeze = 0;
@@ -65,6 +83,7 @@ void init_rdp(struct rdp_core* dp,
 {
     dp->sp = sp;
     dp->mi = mi;
+    rsp_dp = dp;
 
     init_fb(&dp->fb, mem, rdram, r4300);
 }
@@ -117,6 +136,16 @@ void write_dpc_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mas
         unprotect_framebuffers(&dp->fb);
         gfx.processRDPList();
         protect_framebuffers(&dp->fb);
+#if defined(HAVE_PARALLEL)
+        /* A full sync whose GPU work runs on: its DP interrupt at the next frame
+         * (rdp_pull_deferred_interrupt). */
+        if (parallel_take_deferred_interrupt())
+        {
+            cp0_update_count(dp->mi->r4300);
+            add_interrupt_event(&dp->mi->r4300->cp0, DP_INT, RDP_DEFERRED_DP_DELAY);
+            break;
+        }
+#endif
         signal_rcp_interrupt(dp->mi, MI_INTR_DP);
         break;
     }
@@ -139,10 +168,45 @@ void write_dps_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mas
     masked_write(&dp->dps_regs[reg], value, mask);
 }
 
+void rdp_process_list_from_rsp(void)
+{
+    gfx.processRDPList();
+#if defined(HAVE_PARALLEL)
+    if (rsp_dp && parallel_take_deferred_interrupt())
+    {
+        cp0_update_count(rsp_dp->mi->r4300);
+        add_interrupt_event(&rsp_dp->mi->r4300->cp0, DP_INT, RDP_DEFERRED_DP_DELAY);
+    }
+#endif
+}
+
+void rdp_pull_deferred_interrupt(void)
+{
+    struct cp0* cp0;
+    const unsigned int* at;
+    unsigned int ahead;
+
+    if (!rsp_dp)
+        return;
+    cp0 = &rsp_dp->mi->r4300->cp0;
+    at = get_event(&cp0->q, DP_INT);
+    if (!at)
+        return;
+    /* Only a deferred one is this far ahead (others are a few thousand cycles). */
+    ahead = *at - r4300_cp0_regs(cp0)[CP0_COUNT_REG];
+    if (ahead < RDP_DEFERRED_DP_DELAY / 2 || ahead > RDP_DEFERRED_DP_DELAY)
+        return;
+    remove_event(&cp0->q, DP_INT);
+    add_interrupt_event(cp0, DP_INT, 4000);
+}
+
 void rdp_interrupt_event(void* opaque)
 {
     struct rdp_core* dp = (struct rdp_core*)opaque;
 
+#if defined(HAVE_PARALLEL)
+    parallel_wait_deferred_sync();
+#endif
     raise_rcp_interrupt(dp->mi, MI_INTR_DP);
 }
 

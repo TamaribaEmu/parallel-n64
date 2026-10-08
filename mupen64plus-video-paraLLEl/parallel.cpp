@@ -157,6 +157,22 @@ void parallel_set_synchronous_rdp(bool enable)
 	RDP::synchronous = enable;
 }
 
+void parallel_set_deferred_sync(bool enable)
+{
+	RDP::wait_deferred_sync();
+	RDP::deferred_sync = enable;
+}
+
+int parallel_take_deferred_interrupt(void)
+{
+	return RDP::take_deferred_interrupt() ? 1 : 0;
+}
+
+void parallel_wait_deferred_sync(void)
+{
+	RDP::wait_deferred_sync();
+}
+
 void parallel_set_divot_filter(bool enable)
 {
 	RDP::divot_filter = enable;

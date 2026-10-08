@@ -290,7 +290,7 @@ static m64p_error plugin_start_rsp(void)
     rsp_info.CheckInterrupts = rsp_plugin_check_interrupts;
     rsp_info.ProcessDlistList = gfx.processDList;
     rsp_info.ProcessAlistList = NULL; /* no audio-plugin AList handler; audio type-2 tasks run on the HLE RSP (rsp_audio) */
-    rsp_info.ProcessRdpList = gfx.processRDPList;
+    rsp_info.ProcessRdpList = rdp_process_list_from_rsp;  /* deferred RDP sync: rdp_core.c */
     rsp_info.ShowCFB = gfx.showCFB;
 
     /* call the RSP plugin  */

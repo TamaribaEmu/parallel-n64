@@ -31,6 +31,11 @@
 #include "device/rcp/rdp/rdp_core.h"
 #include "device/rcp/ri/ri_controller.h"
 #include "device/rdram/rdram.h"
+
+#if defined(HAVE_PARALLEL)
+/* ParaLLEl-RDP's deferred sync (mupen64plus-video-paraLLEl/parallel.h). */
+extern int parallel_take_deferred_interrupt(void);
+#endif
 #include "main/main.h"
 #if defined(PROFILE)
 #include "main/profile.h"
@@ -379,6 +384,16 @@ void do_SP_Task(struct rsp_core* sp)
         sp->regs2[SP_PC_REG] |= save_pc;
         new_frame();
 
+        /* ParaLLEl-RDP's deferred sync: the task's full sync left the GPU working
+         * and the DP interrupt to the core, at the next frame (rdp_core.h). */
+        unsigned dp_delay = 4000;
+#if defined(HAVE_PARALLEL)
+        if (parallel_take_deferred_interrupt())
+        {
+            sp->mi->regs[MI_INTR_REG] |= MI_INTR_DP;
+            dp_delay = RDP_DEFERRED_DP_DELAY;
+        }
+#endif
         if (sp->mi->regs[MI_INTR_REG] & MI_INTR_DP)
         {
             sp->mi->regs[MI_INTR_REG] &= ~MI_INTR_DP;
@@ -409,7 +424,7 @@ void do_SP_Task(struct rsp_core* sp)
                  * feeding the movie instead of dropping into the
                  * garbage submission that followed. */
                 cp0_update_count(sp->mi->r4300);
-                add_interrupt_event(&sp->mi->r4300->cp0, DP_INT, 4000);
+                add_interrupt_event(&sp->mi->r4300->cp0, DP_INT, dp_delay);
             }
         }
         sp_delay_time = 1000;

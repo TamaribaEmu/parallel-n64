@@ -31,6 +31,11 @@ extern unsigned upscaling;
 extern unsigned downscaling_steps;
 extern unsigned overscan;
 extern bool synchronous, divot_filter, gamma_dither, vi_aa, vi_scale, dither_filter, interlacing;
+// Deferred sync (with synchronous): a full sync does not stop the CPU; the core raises the DP
+// interrupt a fixed number of cycles later and waits for the GPU then (parallel.h).
+extern bool deferred_sync;
+bool take_deferred_interrupt();
+void wait_deferred_sync();
 extern bool native_texture_lod, native_tex_rect;
 
 void complete_frame();

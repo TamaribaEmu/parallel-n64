@@ -86,6 +86,7 @@ extern void riceRomClosed(void);
 
 #if defined(HAVE_PARALLEL)
 #include "../mupen64plus-video-paraLLEl/parallel.h"
+#include "device/rcp/rdp/rdp_core.h"
 
 static struct retro_hw_render_callback hw_render;
 static struct retro_hw_render_context_negotiation_interface_vulkan hw_context_negotiation;
@@ -1448,16 +1449,20 @@ void update_variables(bool startup)
 #if defined(HAVE_PARALLEL)
    var.key = "parallel-n64-parallel-rdp-synchronous";
    var.value = NULL;
-   if (g_force_parallel_sync)
    {
-      /* This game reads rendered frames back from RDRAM and soft-locks
-       * with asynchronous RDP; ignore the core option. */
-      parallel_set_synchronous_rdp(true);
+      bool deferred = false;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         deferred = !strcmp(var.value, "deferred");
+         /* A game that reads rendered frames back (g_force_parallel_sync) is
+          * synchronous whatever the option says; deferred is synchronous too. */
+         parallel_set_synchronous_rdp(g_force_parallel_sync || deferred || !strcmp(var.value, "enabled"));
+      }
+      else
+         parallel_set_synchronous_rdp(true);
+      parallel_set_deferred_sync(deferred);
    }
-   else if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-      parallel_set_synchronous_rdp(!strcmp(var.value, "enabled"));
-   else
-      parallel_set_synchronous_rdp(true);
+
 
    var.key = "parallel-n64-parallel-rdp-overscan";
    var.value = NULL;
@@ -2817,6 +2822,17 @@ void retro_run (void)
          EmuThreadInit();
       }
       
+#if defined(HAVE_PARALLEL)
+      /* Deferred sync: a frame starts with the previous one's GPU work in memory
+       * (it ran while the frontend waited for the display), so what the CPU reads
+       * never depends on its timing. Savestates wait too; memory read between
+       * frames is waited for by retro_tamariba_sync_memory. */
+      if (gfx_plugin == GFX_PARALLEL)
+      {
+         parallel_wait_deferred_sync();
+         rdp_pull_deferred_interrupt();
+      }
+#endif
       EmuThreadStep();
 
       switch (gfx_plugin)
@@ -2853,6 +2869,18 @@ void retro_reset (void)
      * (power cycle) instead re-ran poweron_device() from inside
      * gen_interrupt(), tearing down live device state mid-transaction. */
     CoreDoCommand(M64CMD_RESET, 0, (void*)0);
+}
+
+/* Tamariba: the console's memory is about to be read exactly (online play's memory checks):
+ * the GPU's writes from a deferred RDP sync must have landed. Achievements and the like read
+ * it without this (a frame being drawn is all that may still change), which keeps the wait
+ * off every frame. */
+RETRO_API void retro_tamariba_sync_memory(void)
+{
+#if defined(HAVE_PARALLEL)
+   if (gfx_plugin == GFX_PARALLEL)
+      parallel_wait_deferred_sync();
+#endif
 }
 
 void *retro_get_memory_data(unsigned type)
@@ -2905,6 +2933,10 @@ bool retro_serialize(void *data, size_t size)
     if (initializing)
        return false;
 
+#if defined(HAVE_PARALLEL)
+    if (gfx_plugin == GFX_PARALLEL)
+       parallel_wait_deferred_sync();
+#endif
     if (savestates_save_m64p(data, size))
         return true;
 
@@ -2915,6 +2947,12 @@ bool retro_unserialize(const void * data, size_t size)
 {
     if (initializing)
        return false;
+
+#if defined(HAVE_PARALLEL)
+    /* No GPU write from before may land in the memory being loaded. */
+    if (gfx_plugin == GFX_PARALLEL)
+       parallel_wait_deferred_sync();
+#endif
 
     if (savestates_load_m64p(data, size))
     {

@@ -54,6 +54,11 @@ unsigned downscaling_steps = 0;
 bool native_texture_lod = false;
 bool native_tex_rect = true;
 bool synchronous = true, divot_filter = true, gamma_dither = true;
+bool deferred_sync = false;
+// Deferred sync: the timeline value of the newest full sync not waited for yet, and whether the
+// RDP list just processed ended in one (the core then schedules the DP interrupt).
+static uint64_t deferred_value;
+static bool deferred_interrupt;
 bool vi_aa = true, vi_scale = true, dither_filter = true;
 bool interlacing = true;
 
@@ -154,10 +159,20 @@ void process_commands()
 		if (RDP::Op(command) == RDP::Op::SyncFull)
 		{
 			// For synchronous RDP:
-			if (synchronous && frontend)
-				frontend->wait_for_timeline(frontend->signal_timeline());
-			*gfx_info.MI_INTR_REG |= DP_INTERRUPT;
-			gfx_info.CheckInterrupts();
+			if (synchronous && deferred_sync && frontend)
+			{
+				// The GPU renders while the CPU goes on; the core raises the DP interrupt at
+				// the next frame, after waiting for it (rdp_core.h, RDP_DEFERRED_DP_DELAY).
+				deferred_value = frontend->signal_timeline();
+				deferred_interrupt = true;
+			}
+			else
+			{
+				if (synchronous && frontend)
+					frontend->wait_for_timeline(frontend->signal_timeline());
+				*gfx_info.MI_INTR_REG |= DP_INTERRUPT;
+				gfx_info.CheckInterrupts();
+			}
 		}
 
 		cmd_cur += cmd_length;
@@ -166,6 +181,21 @@ void process_commands()
 	cmd_ptr = 0;
 	cmd_cur = 0;
 	*GET_GFX_INFO(DPC_START_REG) = *GET_GFX_INFO(DPC_CURRENT_REG) = *GET_GFX_INFO(DPC_END_REG);
+}
+
+bool take_deferred_interrupt()
+{
+	const bool out = deferred_interrupt;
+	deferred_interrupt = false;
+	return out;
+}
+
+void wait_deferred_sync()
+{
+	if (!deferred_value || !frontend)
+		return;
+	frontend->wait_for_timeline(deferred_value);
+	deferred_value = 0;
 }
 
 static QueryPoolHandle refresh_begin_ts;
