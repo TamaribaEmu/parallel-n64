@@ -75,12 +75,40 @@ extern "C"
 		WRITE_MEM_U8(rsp->dmem, (addr + 1) & 0xfff, v1);
 	}
 
+	// Bytes [e, end) of a vector register from DMEM at addr, wrapping at its end. With e
+	// and addr both even, whole halfwords at a time: the byte pairs are exactly the DMEM
+	// halfwords (the common case: these loops ran a byte read-modify-write per byte).
+	static inline bool loadHalfWords(RSP::CPUState *rsp, unsigned rt, unsigned e, unsigned end, unsigned addr)
+	{
+		if ((e | addr) & 1)
+			return false;
+		auto *reg = rsp->cp2.regs[rt].e;
+		if (((e | addr | end) & 3) == 0 && (addr & 0xfff) + (end - e) <= 0x1000)
+		{
+			// Whole aligned words: each holds two halfwords, the first in its high half.
+			for (unsigned i = e; i < end; i += 4, addr += 4)
+			{
+				const uint32_t w = READ_MEM_U32(rsp->dmem, (addr & 0xfff));
+				reg[(i & 0xf) >> 1] = uint16_t(w >> 16);
+				reg[((i & 0xf) >> 1) + 1] = uint16_t(w);
+			}
+			return true;
+		}
+		for (unsigned i = e; i + 1 < end; i += 2, addr += 2)
+			reg[(i & 0xf) >> 1] = READ_MEM_U16(rsp->dmem, addr & 0xfff);
+		if ((end - e) & 1)
+			writeByteToHalfWords(reg, (end - 1) & 0xf, READ_MEM_U8(rsp->dmem, addr & 0xfff));
+		return true;
+	}
+
 	// Load 32-bit
 	void RSP_LLV(RSP::CPUState *rsp, unsigned rt, unsigned e, int offset, unsigned base)
 	{
 		TRACE_LS(LLV);
 		unsigned addr = rsp->sr[base] + offset * 4;
 		const unsigned end = (e > 12) ? 16 : (e + 4);
+		if (loadHalfWords(rsp, rt, e, end, addr))
+			return;
 		for (unsigned i = e; i < end; i++)
 			writeByteToHalfWords(rsp->cp2.regs[rt].e, i & 0xf, READ_MEM_U8(rsp->dmem, addr++ & 0xfff));
 	}
@@ -105,6 +133,8 @@ extern "C"
 		TRACE_LS(LDV);
 		unsigned addr = rsp->sr[base] + offset * 8;
 		const unsigned end = (e > 8) ? 16 : (e + 8);
+		if (loadHalfWords(rsp, rt, e, end, addr))
+			return;
 		for (unsigned i = e; i < end; i++)
 			writeByteToHalfWords(rsp->cp2.regs[rt].e, i & 0xf, READ_MEM_U8(rsp->dmem, addr++ & 0xfff));
 	}
@@ -317,6 +347,8 @@ extern "C"
 		unsigned end = 16 + e - (addr & 0xf);
 		if (end > 16) end = 16;
 
+		if (e < end && loadHalfWords(rsp, rt, e, end, addr))
+			return;
 		for (unsigned i = e; i < end; i++)
 			writeByteToHalfWords(rsp->cp2.regs[rt].e, i & 0xf, READ_MEM_U8(rsp->dmem, addr++ & 0xfff));
 	}
@@ -327,6 +359,22 @@ extern "C"
 		unsigned addr = (rsp->sr[base] + offset * 16) & 0xfff;
 		
 		const unsigned end = e + (16 - (addr & 15));
+		if (e == 0 && (addr & 15) == 0)
+		{
+			// The whole register to an aligned block: four words.
+			const auto *reg = rsp->cp2.regs[rt].e;
+			for (unsigned i = 0; i < 8; i += 2)
+				WRITE_MEM_U32(rsp->dmem, (addr + 2 * i), (uint32_t(reg[i]) << 16) | reg[i + 1]);
+			return;
+		}
+		if (((e | addr) & 1) == 0)
+		{
+			// Halfwords (see loadHalfWords); the store stays inside its 16-byte block.
+			const auto *reg = rsp->cp2.regs[rt].e;
+			for (unsigned i = e; i < end; i += 2, addr += 2)
+				WRITE_MEM_U16(rsp->dmem, addr, reg[(i & 15) >> 1]);
+			return;
+		}
 		for (unsigned i = e; i < end; i++)
 			WRITE_MEM_U8(rsp->dmem, addr++, byteFromHalfWords(rsp->cp2.regs[rt].e, i & 15));
 	}
@@ -338,6 +386,8 @@ extern "C"
 		const unsigned start = 16 - ((addr & 0xf) - e);
 		addr &= ~0xf;
 
+		if (start < 16 && loadHalfWords(rsp, rt, start, 16, addr))
+			return;
 		for (unsigned i = start; i < 16; i++)
 			writeByteToHalfWords(rsp->cp2.regs[rt].e, i & 0xf, READ_MEM_U8(rsp->dmem, addr++ & 0xfff));
 	}

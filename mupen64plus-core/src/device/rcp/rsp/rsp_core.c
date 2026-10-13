@@ -332,19 +332,40 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
 static int l_zb_shadow_armed = 1;
 static unsigned l_zb_fresh_n;
 
+/* The capture and shadow switches below are read once: getenv() walks the
+ * whole environment, and this runs for every graphics task. */
+static int l_debug_env_read;
+static const char *l_env_gfx_cap;
+static const char *l_env_gfx_cap_file;
+static const char *l_env_zb_shadow;
+static const char *l_env_zb_shadow_end;
+
+static void read_debug_env(void)
+{
+    if (l_debug_env_read)
+        return;
+    l_env_gfx_cap = getenv("HARNESS_GFX_CAP");
+    l_env_gfx_cap_file = getenv("HARNESS_GFX_CAP_FILE");
+    l_env_zb_shadow = getenv("ZB_SHADOW");
+    l_env_zb_shadow_end = getenv("ZB_SHADOW_END");
+    l_debug_env_read = 1;
+}
+
 void do_SP_Task(struct rsp_core* sp)
 {
     uint32_t save_pc = sp->regs2[SP_PC_REG] & ~0xfff;
 
     uint32_t sp_delay_time;
 
+    read_debug_env();
+
     if (sp->mem[0xfc0/4] == 1)
     {
         {
             static unsigned g1;
-            const char *gc = getenv("HARNESS_GFX_CAP");
+            const char *gc = l_env_gfx_cap;
             if (gc && g1 == (unsigned)strtoul(gc, NULL, 0)) {
-                const char *fn = getenv("HARNESS_GFX_CAP_FILE");
+                const char *fn = l_env_gfx_cap_file;
                 FILE *f = fopen(fn ? fn : "/tmp/gfx_rdram.bin", "wb");
                 if (f) { fwrite(sp->ri->rdram->dram, 1, 0x800000, f);
                          fwrite(sp->mem, 1, 0x2000, f); fclose(f); }
@@ -357,16 +378,16 @@ void do_SP_Task(struct rsp_core* sp)
          * run the HLE walker read-only over the same state and dump its
          * stream for oracle comparison (env ZB_SHADOW). Freshness =
          * first gfx dispatch after the previous task broke. */
-        if (getenv("ZB_SHADOW") && l_zb_shadow_armed)
+        if (l_env_zb_shadow && l_zb_shadow_armed)
         {
             extern int angrylion_zboss_shadow(unsigned char *rdram,
                                               unsigned int rdram_size,
                                               unsigned char *dmem);
-            unsigned want = (unsigned)strtoul(getenv("ZB_SHADOW"), NULL, 0);
+            unsigned want = (unsigned)strtoul(l_env_zb_shadow, NULL, 0);
             l_zb_shadow_armed = 0;
             l_zb_fresh_n++;
             if ((want == 0 || l_zb_fresh_n == want)
-                && !getenv("ZB_SHADOW_END"))
+                && !l_env_zb_shadow_end)
                 angrylion_zboss_shadow((unsigned char*)sp->ri->rdram->dram,
                                        0x800000u,
                                        (unsigned char*)sp->mem);
@@ -487,9 +508,9 @@ void do_SP_Task(struct rsp_core* sp)
     }
     if ((sp->regs[SP_STATUS_REG] & (SP_STATUS_HALT | SP_STATUS_BROKE)))
     {
-        if (getenv("ZB_SHADOW_END") && !l_zb_shadow_armed
+        if (l_env_zb_shadow_end && !l_zb_shadow_armed
             && sp->mem[0xfc0/4] == 1
-            && l_zb_fresh_n == (unsigned)strtoul(getenv("ZB_SHADOW_END"),
+            && l_zb_fresh_n == (unsigned)strtoul(l_env_zb_shadow_end,
                                                  NULL, 0))
         {
             extern int angrylion_zboss_shadow(unsigned char *rdram,

@@ -138,6 +138,8 @@ public:
 	// Queues up state and drawing commands.
 	void enqueue_command(unsigned num_words, const uint32_t *words);
 	void enqueue_command_direct(unsigned num_words, const uint32_t *words);
+	// Many commands at once, packed as [num_words][words...] repeated.
+	void enqueue_packed_commands(const uint32_t *packed, size_t num_packed_words);
 
 	void set_quirks(const Quirks &quirks);
 

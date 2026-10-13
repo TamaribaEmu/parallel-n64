@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 /* rdp_emit_f3d.c -- F3D (Fast3D / "RSP SW 2.0X") display-list dispatcher for
  * the angrylion HLE path. See rdp_emit_f3d.h.
  *
@@ -496,9 +497,24 @@ int f3d_is_ucode(const unsigned char *rdram, unsigned int rdram_size,
 static unsigned int f3d_text_crc(const unsigned char *rdram,
                                  unsigned int rdram_size, unsigned int text)
 {
+    /* The probes below ask for the same text several times per graphics
+     * task, and it rarely changes between tasks: compare it with the copy
+     * hashed last time before hashing it again. */
+    static unsigned char last_text[0xc00];
+    static unsigned int last_cs;
+    static int last_valid;
     unsigned int i, cs = 0;
+    int whole = (text & 3u) == 0 && text < rdram_size && rdram_size - text >= 0xc00u;
+    if (whole && last_valid && memcmp(last_text, rdram + text, 0xc00u) == 0)
+        return last_cs;
     for (i = 0; i < 0xc00u && (text + i) < rdram_size; i++)
         cs = cs * 131u + rdram[(text + i) ^ 3];
+    if (whole)
+    {
+        memcpy(last_text, rdram + text, 0xc00u);
+        last_cs = cs;
+        last_valid = 1;
+    }
     return cs;
 }
 

@@ -26,6 +26,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef PARALLEL_RDP_SHADER_DIR
 #include "global_managers.hpp"
@@ -46,17 +48,29 @@ public:
 	void drain();
 
 	void enqueue_command(unsigned num_words, const uint32_t *words);
+	// A run of commands already in the ring's layout, [num_words][words...] repeated,
+	// queued with one lock per stretch of free space instead of one per command.
+	void enqueue_packed_commands(const uint32_t *packed, size_t num_packed_words);
 
 private:
 	CommandProcessor *processor = nullptr;
 	std::thread thr;
 	std::mutex lock;
-	std::condition_variable cond;
+	// The consumer waits on data_cond for commands; the producer waits on space_cond for
+	// ring space or for drain(). Each side notifies only when the other is waiting: a
+	// notify is a futex syscall on Android whether or not anyone sleeps.
+	std::condition_variable data_cond;
+	std::condition_variable space_cond;
+	bool consumer_waiting = false;
+	unsigned producers_waiting = 0;
 
 	std::vector<uint32_t> ring;
 	uint64_t write_count = 0;
 	uint64_t read_count = 0;
 	uint64_t completed_count = 0;
+
+	void wait_for_space(std::unique_lock<std::mutex> &holder, uint64_t num_words);
+	void copy_in(const uint32_t *words, size_t num_words);
 
 	void thread_loop();
 	void teardown_thread();

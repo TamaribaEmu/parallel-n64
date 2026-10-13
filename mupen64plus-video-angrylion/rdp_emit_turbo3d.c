@@ -23,6 +23,7 @@
  * microcode natively.
  */
 
+#include <string.h>
 #include <stdint.h>
 #include "rdp_emit_frontend.h"
 #include "rdp_emit_f3dex2.h"
@@ -58,6 +59,9 @@ void turbo3d_set_rdram_size(unsigned int size) { s_rdram_size = size; }
  * hashes and the order this match was confirmed against the live task. */
 static unsigned int s_crc_table[256];
 static int s_crc_ready;
+static unsigned char s_last_text[4096];
+static int s_last_match;
+static int s_last_valid;
 
 static void turbo3d_crc_init(void)
 {
@@ -93,12 +97,20 @@ int turbo3d_ucode_match(const unsigned char *rdram, unsigned int rdram_size,
     unsigned int i;
     if (rdram == 0 || text_seg == 0 || text_seg + 4096u > rdram_size)
         return 0;
+    /* Every graphics task of every game comes through here. The text is
+     * almost always the one checked last time: comparing it with a copy
+     * is far cheaper than the byte-at-a-time CRC. */
+    if (s_last_valid && memcmp(s_last_text, rdram + text_seg, 4096u) == 0)
+        return s_last_match;
     if (!s_crc_ready)
         turbo3d_crc_init();
     for (i = 0; i < 4096u; ++i)
         crc = (crc >> 8) ^ s_crc_table[(crc & 0xffu) ^ rdram[text_seg + i]];
     crc ^= 0xffffffffu;
-    return crc == 0x2bdcfc8au;
+    memcpy(s_last_text, rdram + text_seg, 4096u);
+    s_last_match = crc == 0x2bdcfc8au;
+    s_last_valid = 1;
+    return s_last_match;
 }
 
 /* True when [addr, addr+len) lies inside RDRAM. Written subtraction-style

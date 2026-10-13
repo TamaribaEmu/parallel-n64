@@ -164,11 +164,22 @@ void gsp_detect_ucode_params(GSPState *st, const unsigned char *rdram,
     if (rdram != 0 && ud != 0)
     {
         static const char pre[] = "RSP Gfx ucode F3DEX";
+        /* The scan below runs for every graphics task: reuse its answer
+         * while the scanned bytes are the ones scanned last time. */
+        static unsigned char last_bytes[0x1000];
+        static unsigned int last_ud, last_hi;
+        static int last_no_far, last_valid;
         unsigned int plen = sizeof(pre) - 1u;
         unsigned int hi = ud + 0x1000u;
         unsigned int b;
         if (hi > rdram_size)
             hi = rdram_size;
+        if (last_valid && ud == last_ud && hi == last_hi
+            && memcmp(last_bytes, rdram + ud, hi - ud) == 0)
+        {
+            st->clip_no_far = last_no_far;
+            goto scanned;
+        }
         for (b = ud; b + plen + 24u <= hi; b++)
         {
             unsigned int k;
@@ -190,7 +201,17 @@ void gsp_detect_ucode_params(GSPState *st, const unsigned char *rdram,
             }
             break;
         }
+        /* word-aligned only: the byte-swizzled reads stay inside */
+        if (hi > ud && hi - ud <= sizeof(last_bytes) && ((ud | hi) & 3) == 0)
+        {
+            memcpy(last_bytes, rdram + ud, hi - ud);
+            last_ud = ud;
+            last_hi = hi;
+            last_no_far = st->clip_no_far;
+            last_valid = 1;
+        }
     }
+scanned:
     /* The data address at a mid-list G_LOAD_UCODE comes from the staged
      * G_RDPHALF_1 word, which display lists also use for branch targets;
      * validate that it really points at an F3DEX2-family data segment

@@ -33,6 +33,10 @@
 #include "hle_internal.h"
 #include "memory.h"
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 struct ramp_t
 {
     int64_t value;
@@ -82,9 +86,9 @@ static void sample_mix(int16_t* dst, int16_t src, int16_t gain)
      * omitted the 0x7fff per-mix attenuation of the running mix: harmless on a
      * single quiet mix, but it costs an LSB once the mixed buffer is loud and
      * the error then persists in the accumulated buffer, drifting from LLE. */
-    int64_t acc = 0x8000 + 2 * (int64_t)((int32_t)(*dst) * 0x7fff)
-                         + 2 * (int64_t)((int32_t)src * (int32_t)gain);
-    *dst = clamp_s16((int_fast32_t)(acc >> 16));
+    /* (0x8000 + 2*x) >> 16 is (0x4000 + x) >> 15, and x fits in 32 bits. */
+    int32_t acc = 0x4000 + (int32_t)(*dst) * 0x7fff + (int32_t)src * (int32_t)gain;
+    *dst = clamp_s16(acc >> 15);
 }
 
 static void alist_envmix_mix(size_t n, int16_t** dst, const int16_t* gains, int16_t src)
@@ -200,6 +204,17 @@ void alist_save(struct hle_t* hle, uint16_t dmem, uint32_t address, uint16_t cou
 
 void alist_move(struct hle_t* hle, uint16_t dmemo, uint16_t dmemi, uint16_t count)
 {
+    /* Word-aligned, inside DMEM, and not overlapping in a way a forward
+     * byte copy would notice (destination below the source, or past its
+     * end): the byte swizzle keeps bytes inside their words, so this is
+     * a plain memmove. */
+    if (((dmemo | dmemi | count) & 3) == 0
+            && (uint32_t)dmemo + count <= 0x1000 && (uint32_t)dmemi + count <= 0x1000
+            && (dmemo <= dmemi || dmemo >= (uint32_t)dmemi + count)) {
+        memmove(hle->alist_buffer + dmemo, hle->alist_buffer + dmemi, count);
+        return;
+    }
+
     while (count != 0) {
         *alist_u8(hle, dmemo++) = *alist_u8(hle, dmemi++);
         --count;
@@ -870,6 +885,31 @@ void alist_envmix_lin(
     memcpy(hle->dram + address, (uint8_t *)save_buffer, 80);
 }
 
+/* Two buffers that advance together either are the same buffer or never
+ * share any part of a block of 8 samples. */
+static bool envmix_same_or_apart(const int16_t* a, const int16_t* b)
+{
+    ptrdiff_t d = (const uint8_t*)a - (const uint8_t*)b;
+    return d == 0 || d >= 16 || d <= -16;
+}
+
+static bool envmix_blocks_independent(const int16_t* in, const int16_t* dl,
+        const int16_t* dr, const int16_t* wl, const int16_t* wr)
+{
+    return envmix_same_or_apart(in, dl) && envmix_same_or_apart(in, dr)
+        && envmix_same_or_apart(in, wl) && envmix_same_or_apart(in, wr)
+        && envmix_same_or_apart(dl, dr) && envmix_same_or_apart(dl, wl)
+        && envmix_same_or_apart(dl, wr) && envmix_same_or_apart(dr, wl)
+        && envmix_same_or_apart(dr, wr) && envmix_same_or_apart(wl, wr);
+}
+
+/* Inside DMEM: past its end lie the ucodes' own state, the envelope
+ * values among them. */
+static bool envmix_inside(const struct hle_t* hle, const int16_t* p, unsigned count)
+{
+    return (const uint8_t*)(p + count) <= hle->alist_buffer + sizeof(hle->alist_buffer);
+}
+
 void alist_envmix_nead(
         struct hle_t* hle,
         bool swap_wet_LR,
@@ -894,6 +934,57 @@ void alist_envmix_nead(
 
     if (swap_wet_LR)
         swap(&wl, &wr);
+
+    /* When no two of the five buffers overlap within a block of 8 samples
+     * (each pair is either the same buffer or at least a block apart), the
+     * order of the samples inside a block does not matter: run the block
+     * buffer by buffer, which the compiler turns into vector code. */
+    if (envmix_blocks_independent(in, dl, dr, wl, wr)
+            && envmix_inside(hle, in, count) && envmix_inside(hle, dl, count)
+            && envmix_inside(hle, dr, count) && envmix_inside(hle, wl, count)
+            && envmix_inside(hle, wr, count)) {
+        uint32_t e0 = env_values[0], e1 = env_values[1], e2 = env_values[2];
+        const uint32_t s0 = env_steps[0], s1 = env_steps[1], s2 = env_steps[2];
+        const uint16_t x0 = xors[0], x1 = xors[1], x2 = xors[2], x3 = xors[3];
+
+        while (count != 0) {
+            int16_t l[8], r[8], l2[8], r2[8];
+            size_t i;
+            for (i = 0; i < 8; ++i) {
+                uint32_t v = (uint32_t)(int32_t)in[i];
+                l[i]  = (int16_t)((uint16_t)((v * (e0 & 0xffff)) >> 16) ^ x0);
+                r[i]  = (int16_t)((uint16_t)((v * (e1 & 0xffff)) >> 16) ^ x1);
+            }
+            for (i = 0; i < 8; ++i) {
+                l2[i] = (int16_t)((uint16_t)(((uint32_t)(int32_t)l[i] * (e2 & 0xffff)) >> 16) ^ x2);
+                r2[i] = (int16_t)((uint16_t)(((uint32_t)(int32_t)r[i] * (e2 & 0xffff)) >> 16) ^ x3);
+            }
+            for (i = 0; i < 8; ++i)
+                dl[i] = clamp_s16(dl[i] + l[i]);
+            for (i = 0; i < 8; ++i)
+                dr[i] = clamp_s16(dr[i] + r[i]);
+            for (i = 0; i < 8; ++i)
+                wl[i] = clamp_s16(wl[i] + l2[i]);
+            for (i = 0; i < 8; ++i)
+                wr[i] = clamp_s16(wr[i] + r2[i]);
+
+            e0 += s0;
+            e1 += s1;
+            e2 += s2;
+
+            dl += 8;
+            dr += 8;
+            wl += 8;
+            wr += 8;
+            in += 8;
+            count -= 8;
+        }
+
+        env_values[0] = (uint16_t)e0;
+        env_values[1] = (uint16_t)e1;
+        env_values[2] = (uint16_t)e2;
+        return;
+    }
 
     while (count != 0) {
         size_t i;
@@ -981,6 +1072,80 @@ void alist_add(struct hle_t* hle, uint16_t dmemo, uint16_t dmemi, uint16_t count
     }
 }
 
+/* One output sample of RESAMPLE. The microcode computes each tap with
+ * vmulf (independently rounded and clamped Q15 product:
+ * (2*a*b + 0x8000) >> 16, which is (a*b + 0x4000) >> 15 without needing
+ * 64 bits) and combines them with a tree of saturating vadds:
+ * sat(sat(q0+q1) + sat(q2+q3)). Summing raw products and shifting once
+ * is up to a few LSBs off, which is audible as a DC bias on near-silent
+ * material and breaks bit-exactness against LLE. */
+static inline int16_t resample_point(struct hle_t* hle, unsigned ipos, const int16_t* lut)
+{
+    const int16_t* buf = (const int16_t*)hle->alist_buffer;
+    int32_t q0 = clamp_s16((buf[((ipos    ) ^ S) & 0xfff] * lut[0] + 0x4000) >> 15);
+    int32_t q1 = clamp_s16((buf[((ipos + 1) ^ S) & 0xfff] * lut[1] + 0x4000) >> 15);
+    int32_t q2 = clamp_s16((buf[((ipos + 2) ^ S) & 0xfff] * lut[2] + 0x4000) >> 15);
+    int32_t q3 = clamp_s16((buf[((ipos + 3) ^ S) & 0xfff] * lut[3] + 0x4000) >> 15);
+
+    return clamp_s16(clamp_s16(q0 + q1) + clamp_s16(q2 + q3));
+}
+
+/* RESAMPLE with the input copied out of DMEM's byte order first, when that
+ * cannot be told apart from the sample-by-sample loop: input and output
+ * inside DMEM and not sharing a word, so no output lands on a sample still
+ * to be read. Advances ipos/opos/pitch_accu like the loop and returns true,
+ * or does nothing and returns false. */
+static bool resample_linear(struct hle_t* hle, uint16_t* ipos, uint16_t* opos,
+        uint16_t count, uint32_t pitch, uint32_t* pitch_accu)
+{
+    int16_t lin[0x800 + 4];
+    int16_t* const buf = (int16_t*)hle->alist_buffer;
+    const unsigned dmem_samples = sizeof(hle->alist_buffer) / 2;
+    const unsigned in0 = *ipos, out0 = *opos;
+    unsigned in_end, k;
+    uint32_t accu = *pitch_accu;
+    unsigned pos = 0;
+
+    if (count == 0 || pitch >= (1u << 24))
+        return false;
+
+    /* the window's last tap reads ipos + 3 at the final position */
+    in_end = in0 + (unsigned)(((uint64_t)accu + (uint64_t)pitch * (count - 1)) >> 16) + 4;
+    if (in_end > dmem_samples || out0 + count > dmem_samples)
+        return false;
+    /* compare whole words: the byte order swaps samples within a word */
+    if (!((out0 + count + 1) / 2 <= in0 / 2 || (in_end + 1) / 2 <= out0 / 2))
+        return false;
+
+    for (k = in0; k < in_end; ++k)
+        lin[k - in0] = buf[k ^ S];
+
+    for (k = 0; k < count; ++k) {
+        const int16_t* lut = RESAMPLE_LUT + ((accu & 0xfc00) >> 8);
+        const int16_t* x = lin + pos;
+#if defined(__aarch64__)
+        int16x4_t q = vqrshrn_n_s32(vmull_s16(vld1_s16(x), vld1_s16(lut)), 15);
+        int16x4_t pair = vqadd_s16(q, vrev32_s16(q));
+        int16x4_t sum = vqadd_s16(pair, vreinterpret_s16_s64(vshr_n_s64(vreinterpret_s64_s16(pair), 32)));
+        buf[(out0 + k) ^ S] = vget_lane_s16(sum, 0);
+#else
+        int32_t q0 = clamp_s16((x[0] * lut[0] + 0x4000) >> 15);
+        int32_t q1 = clamp_s16((x[1] * lut[1] + 0x4000) >> 15);
+        int32_t q2 = clamp_s16((x[2] * lut[2] + 0x4000) >> 15);
+        int32_t q3 = clamp_s16((x[3] * lut[3] + 0x4000) >> 15);
+        buf[(out0 + k) ^ S] = clamp_s16(clamp_s16(q0 + q1) + clamp_s16(q2 + q3));
+#endif
+        accu += pitch;
+        pos += accu >> 16;
+        accu &= 0xffff;
+    }
+
+    *ipos = (uint16_t)(in0 + pos);
+    *opos = (uint16_t)(out0 + count);
+    *pitch_accu = accu;
+    return true;
+}
+
 static void alist_resample_reset(struct hle_t* hle, uint16_t pos, uint32_t* pitch_accu)
 {
     unsigned k;
@@ -1036,27 +1201,13 @@ void alist_resample(
     else
         alist_resample_load(hle, address, ipos, &pitch_accu);
 
+    if (resample_linear(hle, &ipos, &opos, count, pitch, &pitch_accu))
+        count = 0;
+
     while (count != 0) {
         const int16_t* lut = RESAMPLE_LUT + ((pitch_accu & 0xfc00) >> 8);
 
-        /* The microcode computes each tap with vmulf (independently
-         * rounded and clamped Q15 product: (2*a*b + 0x8000) >> 16) and
-         * combines them with a tree of saturating vadds:
-         * sat(sat(q0+q1) + sat(q2+q3)). Summing raw products and
-         * shifting once is up to a few LSBs off, which is audible as a
-         * DC bias on near-silent material and breaks bit-exactness
-         * against LLE. */
-        int32_t q0 = (int32_t)(((int64_t)2 * *sample(hle, ipos    ) * lut[0] + 0x8000) >> 16);
-        int32_t q1 = (int32_t)(((int64_t)2 * *sample(hle, ipos + 1) * lut[1] + 0x8000) >> 16);
-        int32_t q2 = (int32_t)(((int64_t)2 * *sample(hle, ipos + 2) * lut[2] + 0x8000) >> 16);
-        int32_t q3 = (int32_t)(((int64_t)2 * *sample(hle, ipos + 3) * lut[3] + 0x8000) >> 16);
-
-        q0 = clamp_s16(q0);
-        q1 = clamp_s16(q1);
-        q2 = clamp_s16(q2);
-        q3 = clamp_s16(q3);
-
-        *sample(hle, opos++) = clamp_s16(clamp_s16(q0 + q1) + clamp_s16(q2 + q3));
+        *sample(hle, opos++) = resample_point(hle, ipos, lut);
 
         pitch_accu += pitch;
         ipos += (pitch_accu >> 16);
@@ -1122,22 +1273,14 @@ void alist_resample_audio(
     pitch_accu = (uint16_t)*alist_s16(hle, ALIST_AUDIO_STATE_SLAB + 0x8);
     ipos = in >> 1;
 
+    if (resample_linear(hle, &ipos, &opos, count, pitch, &pitch_accu))
+        count = 0;
+
     while (count != 0) {
         const int16_t* lut = RESAMPLE_LUT + ((pitch_accu & 0xfc00) >> 8);
 
-        /* Identical arithmetic to alist_resample: per-tap vmulf with
-         * a tree of saturating vadds. */
-        int32_t q0 = (int32_t)(((int64_t)2 * *sample(hle, ipos    ) * lut[0] + 0x8000) >> 16);
-        int32_t q1 = (int32_t)(((int64_t)2 * *sample(hle, ipos + 1) * lut[1] + 0x8000) >> 16);
-        int32_t q2 = (int32_t)(((int64_t)2 * *sample(hle, ipos + 2) * lut[2] + 0x8000) >> 16);
-        int32_t q3 = (int32_t)(((int64_t)2 * *sample(hle, ipos + 3) * lut[3] + 0x8000) >> 16);
-
-        q0 = clamp_s16(q0);
-        q1 = clamp_s16(q1);
-        q2 = clamp_s16(q2);
-        q3 = clamp_s16(q3);
-
-        *sample(hle, opos++) = clamp_s16(clamp_s16(q0 + q1) + clamp_s16(q2 + q3));
+        /* Identical arithmetic to alist_resample. */
+        *sample(hle, opos++) = resample_point(hle, ipos, lut);
 
         pitch_accu += pitch;
         ipos += (pitch_accu >> 16);
@@ -1331,6 +1474,26 @@ void alist_mix_nead(struct hle_t* hle, uint16_t dmemo, uint16_t dmemi, uint16_t 
     int16_t d0[8], d1[8], s0[8], s1[8], r0[8], r1[8];
     int32_t remaining = (int32_t)count;
     unsigned int i;
+
+    /* The usual cases: word-aligned buffers inside DMEM, with the source
+     * at or ahead of the destination (in place, or a delay line reading
+     * ahead) or entirely behind it. Every sample is then mixed from values
+     * no store has touched yet, whatever the block schedule, so the mix is
+     * one forward pass. 2*(a*b) + 0x8000 >> 16 is (a*b) + 0x4000 >> 15,
+     * which fits in 32 bits here. */
+    {
+        uint32_t bytes = count ? ((uint32_t)count + 0x1f) & ~0x1fu : 0x20;
+        if (((dmemo | dmemi) & 3) == 0
+                && (uint32_t)dmemo + bytes <= 0x1000 && (uint32_t)dmemi + bytes <= 0x1000
+                && (dmemi >= dmemo || (uint32_t)dmemi + bytes <= dmemo)) {
+            int16_t* dst = (int16_t*)(hle->alist_buffer + dmemo);
+            const int16_t* src = (const int16_t*)(hle->alist_buffer + dmemi);
+            uint32_t n = bytes >> 1;
+            for (i = 0; i < n; ++i)
+                dst[i] = clamp_s16((0x4000 + (int32_t)dst[i] * 0x7fff + (int32_t)src[i] * gain) >> 15);
+            return;
+        }
+    }
 
     for (i = 0; i < 8; ++i) {
         d0[i] = *alist_s16(hle, dmemo + (uint16_t)(i << 1));

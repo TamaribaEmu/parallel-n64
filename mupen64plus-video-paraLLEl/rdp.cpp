@@ -4,6 +4,7 @@
 #include "parallel.h"
 #include "z64.h"
 #include <assert.h>
+#include <string.h>
 
 using namespace Vulkan;
 using namespace std;
@@ -68,6 +69,21 @@ static const unsigned cmd_len_lut[64] = {
 	1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1,  1,  1,  1,  1,  1,
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  1,  1,  1,  1,  1,
 };
+
+/* Commands on their way to the RDP thread, as [num_words][words...] repeated: handed over
+ * a couple of hundred at a time (one lock on the command ring) rather than one by one. A
+ * full sync, the end of the list and an incomplete command flush them, so the RDP gets the
+ * same commands in the same order, all before process_commands() returns. */
+static const size_t packed_capacity = 2048;
+static uint32_t packed[packed_capacity];
+static size_t packed_count;
+
+static void flush_packed()
+{
+	if (packed_count && frontend)
+		frontend->enqueue_packed_commands(packed, packed_count);
+	packed_count = 0;
+}
 
 void set_hle_cmd_buffer(const uint8_t *buf, uint32_t base_byte_addr, uint32_t len_bytes)
 {
@@ -149,15 +165,23 @@ void process_commands()
 
 		if (cmd_ptr - cmd_cur - cmd_length < 0)
 		{
+			flush_packed();
 			*GET_GFX_INFO(DPC_START_REG) = *GET_GFX_INFO(DPC_CURRENT_REG) = *GET_GFX_INFO(DPC_END_REG);
 			return;
 		}
 
 		if (command >= 8 && frontend)
-			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
+		{
+			if (packed_count + 1 + cmd_length * 2 > packed_capacity)
+				flush_packed();
+			packed[packed_count++] = cmd_length * 2;
+			memcpy(&packed[packed_count], &cmd_data[2 * cmd_cur], cmd_length * 2 * sizeof(uint32_t));
+			packed_count += cmd_length * 2;
+		}
 
 		if (RDP::Op(command) == RDP::Op::SyncFull)
 		{
+			flush_packed();
 			// For synchronous RDP:
 			if (synchronous && deferred_sync && frontend)
 			{
@@ -178,6 +202,7 @@ void process_commands()
 		cmd_cur += cmd_length;
 	}
 
+	flush_packed();
 	cmd_ptr = 0;
 	cmd_cur = 0;
 	*GET_GFX_INFO(DPC_START_REG) = *GET_GFX_INFO(DPC_CURRENT_REG) = *GET_GFX_INFO(DPC_END_REG);

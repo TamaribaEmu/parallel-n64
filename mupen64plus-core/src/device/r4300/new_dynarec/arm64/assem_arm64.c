@@ -1135,9 +1135,7 @@ static void emit_mov(int rs,int rt)
 
 static void emit_mov64(int rs,int rt)
 {
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   if(rs==rt) return;
-#endif
   assem_debug("mov %s,%s",regname64[rt],regname64[rs]);
   output_w32(0xaa000000|rs<<16|WZR<<5|rt);
 }
@@ -1862,7 +1860,6 @@ static void emit_cmovs_imm(int imm,int rt)
   }
 }
 
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
 /* ARM64 can materialize a condition directly.  The older path first
    initializes the destination and then conditionally increments it. */
 static void emit_cset(int cond,int rt)
@@ -1871,7 +1868,6 @@ static void emit_cset(int cond,int rt)
   assem_debug("cset %s,%d",regname[rt],cond);
   output_w32(0x1a800400|WZR<<16|(cond^1)<<12|WZR<<5|rt);
 }
-#endif
 
 static void emit_cmove_reg(int rs,int rt)
 {
@@ -1923,28 +1919,14 @@ static void emit_csel_ls(int rs1,int rs2,int rt)
 
 static void emit_slti32(int rs,int imm,int rt)
 {
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   emit_cmpimm(rs,imm);
   emit_cset(COND_LT,rt);
-#else
-  if(rs!=rt) emit_zeroreg(rt);
-  emit_cmpimm(rs,imm);
-  if(rs==rt) emit_movimm(0,rt);
-  emit_cmovl_imm(1,rt);
-#endif
 }
 
 static void emit_sltiu32(int rs,int imm,int rt)
 {
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   emit_cmpimm(rs,imm);
   emit_cset(COND_CC,rt);
-#else
-  if(rs!=rt) emit_zeroreg(rt);
-  emit_cmpimm(rs,imm);
-  if(rs==rt) emit_movimm(0,rt);
-  emit_cmovb_imm(1,rt);
-#endif
 }
 
 static void emit_slti64_32(int rsh,int rsl,int imm,int rt)
@@ -1991,25 +1973,14 @@ static void emit_set_gz32(int rs, int rt)
 {
   //assem_debug("set_gz32");
   emit_cmpimm(rs,1);
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   emit_cset(COND_GE,rt);
-#else
-  emit_movimm(1,rt);
-  emit_cmovl_imm(0,rt);
-#endif
 }
 
 static void emit_set_nz32(int rs, int rt)
 {
   //assem_debug("set_nz32");
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   emit_test(rs,rs);
   emit_cset(COND_NE,rt);
-#else
-  if(rs!=rt) emit_mov(rs,rt);
-  emit_test(rs,rs);
-  emit_cmovne_imm(1,rt);
-#endif
 }
 
 static void emit_set_gz64_32(int rsh, int rsl, int rt)
@@ -2032,29 +2003,15 @@ static void emit_set_nz64_32(int rsh, int rsl, int rt)
 static void emit_set_if_less32(int rs1, int rs2, int rt)
 {
   //assem_debug("set if less (%%%s,%%%s),%%%s",regname[rs1],regname[rs2],regname[rt]);
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   emit_cmp(rs1,rs2);
   emit_cset(COND_LT,rt);
-#else
-  if(rs1!=rt&&rs2!=rt) emit_zeroreg(rt);
-  emit_cmp(rs1,rs2);
-  if(rs1==rt||rs2==rt) emit_movimm(0,rt);
-  emit_cmovl_imm(1,rt);
-#endif
 }
 
 static void emit_set_if_carry32(int rs1, int rs2, int rt)
 {
   //assem_debug("set if carry (%%%s,%%%s),%%%s",regname[rs1],regname[rs2],regname[rt]);
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   emit_cmp(rs1,rs2);
   emit_cset(COND_CC,rt);
-#else
-  if(rs1!=rt&&rs2!=rt) emit_zeroreg(rt);
-  emit_cmp(rs1,rs2);
-  if(rs1==rt||rs2==rt) emit_movimm(0,rt);
-  emit_cmovb_imm(1,rt);
-#endif
 }
 
 static void emit_set_if_less64_32(int u1, int l1, int u2, int l2, int rt)
@@ -2063,14 +2020,8 @@ static void emit_set_if_less64_32(int u1, int l1, int u2, int l2, int rt)
   assert(u1!=rt);
   assert(u2!=rt);
   emit_cmp(l1,l2);
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   emit_sbcs(u1,u2,HOST_TEMPREG);
   emit_cset(COND_LT,rt);
-#else
-  emit_movimm(0,rt);
-  emit_sbcs(u1,u2,HOST_TEMPREG);
-  emit_cmovl_imm(1,rt);
-#endif
 }
 
 static void emit_set_if_carry64_32(int u1, int l1, int u2, int l2, int rt)
@@ -2079,14 +2030,8 @@ static void emit_set_if_carry64_32(int u1, int l1, int u2, int l2, int rt)
   assert(u1!=rt);
   assert(u2!=rt);
   emit_cmp(l1,l2);
-#ifdef PARALLEL_N64_EXPERIMENTAL_CORE
   emit_sbcs(u1,u2,HOST_TEMPREG);
   emit_cset(COND_CC,rt);
-#else
-  emit_movimm(0,rt);
-  emit_sbcs(u1,u2,HOST_TEMPREG);
-  emit_cmovb_imm(1,rt);
-#endif
 }
 
 static void emit_call(intptr_t a)

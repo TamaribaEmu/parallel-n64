@@ -626,7 +626,15 @@ static ucode_func_t try_normal_task_detection(struct hle_t* hle)
         sum_bytes((void*)dram_u32(hle, *dmem_u32(hle, TASK_UCODE)), min(*dmem_u32(hle, TASK_UCODE_SIZE), 0xf80) >> 1);
 
     {
-        const char *tp = getenv("HLE_UCODE_DUMP");
+        /* read once: this runs for every task */
+        static int dump_env_read;
+        static const char *dump_path;
+        const char *tp;
+        if (!dump_env_read) {
+            dump_path = getenv("HLE_UCODE_DUMP");
+            dump_env_read = 1;
+        }
+        tp = dump_path;
         if (tp) {
             FILE *tf = fopen(tp, "wb");
             if (tf) {

@@ -26,6 +26,8 @@
 #include "thread_id.hpp"
 #include "thread_name.hpp"
 #include <assert.h>
+#include <string.h>
+#include <algorithm>
 #ifdef __ANDROID__
 #include <sched.h>
 #endif
@@ -67,27 +69,46 @@ CommandRing::~CommandRing()
 void CommandRing::drain()
 {
 	std::unique_lock<std::mutex> holder{lock};
-	cond.wait(holder, [this]() {
-		return write_count == completed_count;
-	});
+	while (write_count != completed_count)
+	{
+		producers_waiting++;
+		space_cond.wait(holder);
+		producers_waiting--;
+	}
+}
+
+void CommandRing::wait_for_space(std::unique_lock<std::mutex> &holder, uint64_t num_words)
+{
+	while (write_count + num_words > read_count + ring.size())
+	{
+		producers_waiting++;
+		space_cond.wait(holder);
+		producers_waiting--;
+	}
+}
+
+void CommandRing::copy_in(const uint32_t *words, size_t num_words)
+{
+	size_t mask = ring.size() - 1;
+	size_t offset = write_count & mask;
+	size_t first = std::min(num_words, ring.size() - offset);
+	memcpy(ring.data() + offset, words, first * sizeof(uint32_t));
+	memcpy(ring.data(), words + first, (num_words - first) * sizeof(uint32_t));
+	write_count += num_words;
 }
 
 void CommandRing::enqueue_command(unsigned num_words, const uint32_t *words)
 {
-	bool was_empty;
+	bool wake;
 	{
 		std::unique_lock<std::mutex> holder{lock};
-		cond.wait(holder, [this, num_words]() {
-			return write_count + num_words + 1 <= read_count + ring.size();
-		});
+		wait_for_space(holder, num_words + 1);
 
 		// The consumer only sleeps when it observes an empty ring (its predicate
-		// is write_count > read_count, evaluated under this same lock). So a
-		// notify is only required on the empty -> non-empty transition; skipping
-		// it otherwise cannot lose a wakeup, and the consumer's 500us wait_for
-		// is a further backstop. This removes one futex wake per RDP command,
-		// which on a 4x A57 was a large share of the emulation thread.
-		was_empty = write_count == read_count;
+		// is write_count > read_count, evaluated under this same lock), and says
+		// so in consumer_waiting. Waking it is only needed then, and is required:
+		// once it has reported idle it sleeps without a timeout.
+		wake = consumer_waiting && write_count == read_count;
 
 		size_t mask = ring.size() - 1;
 		ring[write_count++ & mask] = num_words;
@@ -97,8 +118,35 @@ void CommandRing::enqueue_command(unsigned num_words, const uint32_t *words)
 
 	// Notified outside the lock so the woken consumer does not immediately
 	// block on a mutex we still hold.
-	if (was_empty)
-		cond.notify_one();
+	if (wake)
+		data_cond.notify_one();
+}
+
+void CommandRing::enqueue_packed_commands(const uint32_t *packed, size_t num_packed_words)
+{
+	size_t pos = 0;
+	while (pos < num_packed_words)
+	{
+		bool wake;
+		{
+			std::unique_lock<std::mutex> holder{lock};
+			wait_for_space(holder, packed[pos] + 1);
+
+			// Whole commands only: the consumer takes write_count > read_count to
+			// mean a complete command is waiting.
+			size_t space = size_t(read_count + ring.size() - write_count);
+			size_t end = pos;
+			while (end < num_packed_words && end - pos + packed[end] + 1 <= space)
+				end += packed[end] + 1;
+
+			wake = consumer_waiting && write_count == read_count;
+			copy_in(packed + pos, end - pos);
+			pos = end;
+		}
+
+		if (wake)
+			data_cond.notify_one();
+	}
 }
 
 void CommandRing::thread_loop()
@@ -134,16 +182,33 @@ void CommandRing::thread_loop()
 	constexpr auto command_wait = std::chrono::microseconds(500);
 #endif
 
+	// Set once the RDP has been told it is idle: nothing can change until the next
+	// command, so the thread then sleeps until one arrives instead of waking every
+	// 500us to say so again (the producer wakes it: see consumer_waiting).
+	bool idle_notified = false;
+
 	for (;;)
 	{
 		bool is_idle = false;
 		bool saw_exit = false;
+		bool wake_producer = false;
 		uint64_t drained_up_to = 0;
 		batch.clear();
 
 		{
 			std::unique_lock<std::mutex> holder{lock};
-			if (cond.wait_for(holder, command_wait, [this]() { return write_count > read_count; }))
+			if (write_count == read_count)
+			{
+				consumer_waiting = true;
+				if (idle_notified)
+					data_cond.wait(holder, [this]() { return write_count > read_count; });
+				else
+					data_cond.wait_for(holder, command_wait, [this]() { return write_count > read_count; });
+				consumer_waiting = false;
+			}
+			idle_notified = false;
+
+			if (write_count > read_count)
 			{
 				// Drain in bulk, but bounded. Amortizing the lock over many
 				// commands is the point; draining an unbounded run is not,
@@ -180,6 +245,7 @@ void CommandRing::thread_loop()
 				// read_count is what the producer's free-space predicate tests,
 				// so ring space is released here, before the batch executes.
 				drained_up_to = read_count;
+				wake_producer = producers_waiting != 0;
 			}
 			else
 			{
@@ -193,11 +259,13 @@ void CommandRing::thread_loop()
 		{
 			const uint32_t meta_idle = uint32_t(Op::MetaIdle) << 24;
 			processor->enqueue_command_direct(1, &meta_idle);
+			idle_notified = true;
 			continue;
 		}
 
 		// Wake a producer that was blocked on ring space.
-		cond.notify_all();
+		if (wake_producer)
+			space_cond.notify_all();
 
 		// enqueue_command_direct dispatches exactly one command, so walk the
 		// batch. Done outside the lock: this is the actual RDP work.
@@ -213,8 +281,10 @@ void CommandRing::thread_loop()
 			// so it is only published now that the batch has actually run.
 			std::lock_guard<std::mutex> holder{lock};
 			completed_count = drained_up_to;
+			wake_producer = producers_waiting != 0;
 		}
-		cond.notify_all();
+		if (wake_producer)
+			space_cond.notify_all();
 
 		if (saw_exit)
 			break;

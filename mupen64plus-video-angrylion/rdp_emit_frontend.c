@@ -928,7 +928,18 @@ void gsp_vertex(GSPState *s, const unsigned char *rdram, unsigned int addr,
                         inten = 0x7fff;
                     else
                     {
-                        inten = ((int64_t)s->cbfd_lca[li] << 11) / len;
+                        /* One division per light and vertex: settle the
+                         * common far (0) and near (clamped) cases first and
+                         * divide in 32 bits when the operands allow it. */
+                        int64_t num = (int64_t)s->cbfd_lca[li] << 11;
+                        if (num < 0 || num > 0xffffffffLL)
+                            inten = num / len;
+                        else if (len > num)
+                            inten = 0;
+                        else if (num >= 0x8000 * len)
+                            inten = 0x8000;
+                        else
+                            inten = (uint32_t)num / (uint32_t)len;
                         if (inten > 0x7fff) inten = 0x7fff;
                     }
                     if ((s->geometry_mode & 0x00400000u) && inten > 0)
@@ -1636,6 +1647,12 @@ static void gsp_clip_subdivide(GSPState *st, GSPVertex *out,
 {
     int32_t on_pos[4], off_pos[4], out_pos[4];
     int16_t on_attr[8], off_attr[8], out_attr[8];
+    /* The new vertex is a stack slot of the caller's polygon: every field
+     * the triangle write reads must be set here. Clipping only runs on the
+     * transform path, so it is never a 2D overlay vertex (left unset, the
+     * colour fractions of clipped triangles followed whatever the stack
+     * held, which differs between builds and between machines). */
+    out->flat2d = 0;
     on_pos[0] = onv->cx;  on_pos[1] = onv->cy;
     on_pos[2] = onv->cz;  on_pos[3] = onv->cw;
     off_pos[0] = offv->cx; off_pos[1] = offv->cy;

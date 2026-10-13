@@ -115,14 +115,48 @@ void adpcm_compute_residuals(int16_t* dst, const int16_t* src,
     const int16_t l1 = last_samples[0];
     const int16_t l2 = last_samples[1];
 
-    size_t i;
+    /* Same sums as src[i] << 11 + book1[i]*l1 + book2[i]*l2
+     * + rdot(i, book2, src), added column by column so the inner loops
+     * have no dependency chain (wrapping 32-bit arithmetic, so the order
+     * of the terms does not change the result). */
+    uint32_t accu[8];
+    size_t i, k;
 
     assert(count <= 8);
 
-    for(i = 0; i < count; ++i) {
-        int32_t accu = (int32_t)src[i] << 11;
-        accu += book1[i]*l1 + book2[i]*l2 + rdot(i, book2, src);
-        dst[i] = clamp_s16(accu >> 11);
-   }
+    if (count == 8) {
+        /* The common case, with constant bounds: src padded with zeros on
+         * the left turns every column into a whole-vector multiply-add. */
+        int16_t padded[16];
+        for (i = 0; i < 8; ++i) {
+            padded[i] = 0;
+            padded[8 + i] = src[i];
+        }
+        for (i = 0; i < 8; ++i)
+            accu[i] = ((uint32_t)(int32_t)src[i] << 11)
+                    + (uint32_t)(book1[i]*l1) + (uint32_t)(book2[i]*l2);
+        for (k = 0; k < 7; ++k) {
+            const int32_t b = book2[k];
+            const int16_t* const s = padded + 7 - k;
+            for (i = 0; i < 8; ++i)
+                accu[i] += (uint32_t)(b * s[i]);
+        }
+        for (i = 0; i < 8; ++i)
+            dst[i] = clamp_s16((int32_t)accu[i] >> 11);
+        return;
+    }
+
+    for(i = 0; i < count; ++i)
+        accu[i] = ((uint32_t)(int32_t)src[i] << 11)
+                + (uint32_t)(book1[i]*l1) + (uint32_t)(book2[i]*l2);
+
+    for(k = 0; k + 1 < count; ++k) {
+        const int32_t b = book2[k];
+        for(i = k + 1; i < count; ++i)
+            accu[i] += (uint32_t)(b * src[i - 1 - k]);
+    }
+
+    for(i = 0; i < count; ++i)
+        dst[i] = clamp_s16((int32_t)accu[i] >> 11);
 }
 

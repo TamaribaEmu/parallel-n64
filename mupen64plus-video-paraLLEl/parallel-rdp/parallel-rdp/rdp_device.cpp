@@ -28,7 +28,7 @@
 #include <emmintrin.h>
 #endif
 
-#if defined(PARALLEL_N64_EXPERIMENTAL_CORE) && defined(__aarch64__)
+#if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
@@ -158,7 +158,11 @@ CommandProcessor::CommandProcessor(Vulkan::Device &device_, void *rdram_ptr,
 #ifdef PARALLEL_RDP_SHADER_DIR
 				Granite::Global::create_thread_context(),
 #endif
-				this, 4 * 1024);
+				// Room for a whole frame of commands (about 10k words in Pokemon
+				// Stadium 2): the HLE graphics path hands the RDP a frame's list in
+				// one burst, and with a 4k ring the emulation thread sat waiting for
+				// the RDP thread to work through most of it.
+				this, 64 * 1024);
 	}
 
 	if (const char *env = getenv("PARALLEL_RDP_BENCH"))
@@ -914,6 +918,17 @@ void CommandProcessor::enqueue_command(unsigned num_words, const uint32_t *words
 	}
 }
 
+void CommandProcessor::enqueue_packed_commands(const uint32_t *packed, size_t num_packed_words)
+{
+	if (dump_writer || single_threaded_processing)
+	{
+		for (size_t i = 0; i < num_packed_words; i += packed[i] + 1)
+			enqueue_command(packed[i], packed + i + 1);
+	}
+	else
+		ring.enqueue_packed_commands(packed, num_packed_words);
+}
+
 void CommandProcessor::enqueue_command_direct(unsigned, const uint32_t *words)
 {
 #ifdef PARALLEL_N64_EXPERIMENTAL_CORE
@@ -1244,7 +1259,7 @@ bool CommandProcessor::FenceExecutor::is_sentinel(const CoherencyOperation &work
 	return !work.fence && !work.timeline_value;
 }
 
-#if defined(PARALLEL_N64_EXPERIMENTAL_CORE) && defined(__aarch64__)
+#if defined(__aarch64__)
 // Tegra X1 / Cortex-A57: 128-bit NEON masked copy with a zero-mask fast path,
 // processed in 64-byte blocks to match the L1 cache line size. Mask bytes are
 // always fully 0x00 or 0xFF (same invariant the scalar fallback below relies
@@ -1320,7 +1335,9 @@ static void masked_memcpy(uint8_t * __restrict dst,
 		__m128i mask = _mm_loadu_si128(reinterpret_cast<const __m128i *>(masked_src + i));
 		_mm_maskmoveu_si128(data, mask, reinterpret_cast<char *>(dst + i));
 	}
-#elif defined(PARALLEL_N64_EXPERIMENTAL_CORE) && defined(__aarch64__)
+#elif defined(__aarch64__)
+	// The GPU-to-RDRAM write-back of every frame without VK_EXT_external_memory_host
+	// (the Shield): most 64-byte blocks have nothing written and are skipped whole.
 	masked_memcpy_neon(dst, data_src, masked_src, size);
 #else
 	auto * __restrict data32 = reinterpret_cast<const uint32_t *>(data_src);
