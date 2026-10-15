@@ -2708,8 +2708,17 @@ void retro_run (void)
    {
       static float last_aspect = 4.0 / 3.0;
       struct retro_variable var;
+#ifdef HAVE_PARALLEL
+      const unsigned old_upscaling = parallel_get_upscaling();
+#endif
 
       update_variables(false);
+#ifdef HAVE_PARALLEL
+      /* Tamariba: a new upscaling factor takes effect at once (it was only read as
+       * parallel-RDP started). */
+      if (gfx_plugin == GFX_PARALLEL && parallel_get_upscaling() != old_upscaling)
+         parallel_apply_upscaling();
+#endif
 
       var.key = "parallel-n64-aspectratiohint";
       var.value = NULL;

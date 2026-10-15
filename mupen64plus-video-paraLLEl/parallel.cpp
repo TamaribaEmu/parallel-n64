@@ -223,6 +223,11 @@ unsigned parallel_get_upscaling()
 	return RDP::upscaling;
 }
 
+bool parallel_apply_upscaling(void)
+{
+	return RDP::rebuild_frontend();
+}
+
 void parallel_set_downscaling_steps(unsigned steps)
 {
 	RDP::downscaling_steps = steps;

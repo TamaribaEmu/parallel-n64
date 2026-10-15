@@ -16,6 +16,8 @@ namespace RDP
 {
 bool init();
 void deinit();
+// A new upscaling factor while the game runs: the command processor again, at that size.
+bool rebuild_frontend();
 void begin_frame();
 
 void process_commands();

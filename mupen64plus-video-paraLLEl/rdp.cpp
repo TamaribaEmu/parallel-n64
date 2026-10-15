@@ -265,34 +265,10 @@ void begin_frame()
 	//pending_timeline_value = timeline_value;
 }
 
-bool init()
+// The command processor, at the current upscaling: what init builds, and what a new
+// upscaling factor while the game runs rebuilds (rebuild_frontend).
+static bool create_frontend()
 {
-	if (!context || !vulkan)
-		return false;
-
-	unsigned mask = vulkan->get_sync_index_mask(vulkan->handle);
-	unsigned num_frames = 0;
-	unsigned num_sync_frames = 0;
-	for (unsigned i = 0; i < 32; i++)
-	{
-		if (mask & (1u << i))
-		{
-			num_frames = i + 1;
-			num_sync_frames++;
-		}
-	}
-
-	retro_images.resize(num_frames);
-	retro_image_handles.resize(num_frames);
-
-	device.reset(new Device);
-	device->set_context(*context);
-	device->init_frame_contexts(num_sync_frames);
-	log_cb(RETRO_LOG_INFO, "Using %u sync frames for parallel-RDP.\n", num_sync_frames);
-	device->set_queue_lock(
-			[]() { vulkan->lock_queue(vulkan->handle); },
-			[]() { vulkan->unlock_queue(vulkan->handle); });
-
 	uintptr_t aligned_rdram = reinterpret_cast<uintptr_t>(gfx_info.RDRAM);
 	uintptr_t offset = 0;
 
@@ -341,12 +317,65 @@ bool init()
 	quirks.set_native_texture_lod(native_texture_lod);
 	quirks.set_native_resolution_tex_rect(native_tex_rect);
 	frontend->set_quirks(quirks);
+	return true;
+}
+
+bool init()
+{
+	if (!context || !vulkan)
+		return false;
+
+	unsigned mask = vulkan->get_sync_index_mask(vulkan->handle);
+	unsigned num_frames = 0;
+	unsigned num_sync_frames = 0;
+	for (unsigned i = 0; i < 32; i++)
+	{
+		if (mask & (1u << i))
+		{
+			num_frames = i + 1;
+			num_sync_frames++;
+		}
+	}
+
+	retro_images.resize(num_frames);
+	retro_image_handles.resize(num_frames);
+
+	device.reset(new Device);
+	device->set_context(*context);
+	device->init_frame_contexts(num_sync_frames);
+	log_cb(RETRO_LOG_INFO, "Using %u sync frames for parallel-RDP.\n", num_sync_frames);
+	device->set_queue_lock(
+			[]() { vulkan->lock_queue(vulkan->handle); },
+			[]() { vulkan->unlock_queue(vulkan->handle); });
+
+	if (!create_frontend())
+		return false;
 
 	timeline_value = 0;
 	pending_timeline_value = 0;
 	width = 0;
 	height = 0;
 	device_supported = true;
+	return true;
+}
+
+bool rebuild_frontend()
+{
+	if (!frontend || !device)
+		return false;
+	// Everything the old one was given finishes first; the next frame's commands set the
+	// RDP's state again from RDRAM.
+	wait_deferred_sync();
+	frontend->wait_for_timeline(frontend->signal_timeline());
+	device->wait_idle();
+	frontend.reset();
+	if (!create_frontend())
+	{
+		device_supported = false;
+		return false;
+	}
+	timeline_value = 0;
+	pending_timeline_value = 0;
 	return true;
 }
 

@@ -37,6 +37,9 @@ void parallel_set_native_texture_lod(bool enable);
 void parallel_set_native_tex_rect(bool enable);
 
 unsigned parallel_get_upscaling();
+/* After parallel_set_upscaling while the game runs: renders at the new factor from the next
+ * frame (false when parallel-RDP is not running). */
+bool parallel_apply_upscaling(void);
 
 void parallel_set_overscan_crop(unsigned pixels);
 
